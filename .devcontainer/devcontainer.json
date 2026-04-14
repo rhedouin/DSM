@@ -1,0 +1,116 @@
+{
+  "name": "RI-ML (GPU Geo + PyTorch)",
+  "build": {
+    "dockerfile": "./Dockerfile",
+    "context": "..",
+    "args": {
+      "BASE_IMAGE": "nvcr.io/nvidia/pytorch:25.01-py3",
+      "BUILD_VARIANT": "gpu-geo-torch",
+      "BUILD_RAPIDS": "false",
+      "BUILD_TORCH": "true",
+      "BUILD_TF": "false",
+      "INSTALL_GEO_DEPS": "true",
+      "INSTALL_HDF5_DEPS": "false",
+      "USE_CONDA_LOCK": "auto"
+    },
+    "cacheFrom": ["ri-ml"]
+  },
+  "containerEnv": {
+    "MPLCONFIGDIR": "/tmp/matplotlib",
+    "JUPYTER_DATA_DIR": "/tmp/jupyter",
+    "XDG_CACHE_HOME": "/tmp/cache",
+    "NUMBA_CACHE_DIR": "/tmp/numba",
+    "USER": "${localEnv:USER}",
+    "CUDA_HOME": "/usr/local/cuda-12.8",
+    "GDAL_CACHEMAX": "30%",
+    "VSI_CACHE": "TRUE",
+    "VSI_CACHE_SIZE": "10000000",
+    "CPL_VSIL_CURL_CACHE_SIZE": "200000000",
+    "GDAL_NUM_THREADS": "ALL_CPUS",
+    "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "GDAL_HTTP_MULTIPLEX": "YES",
+    "GDAL_INGESTED_BYTES_AT_OPEN": "16384",
+    "TZ": "Europe/London"
+  },
+  "remoteUser": "${localEnv:USER}",
+  "mounts": [
+    "source=${localEnv:HOME},target=/home/${localEnv:USER},type=bind",
+    "source=/data/fast,target=/data/fast,type=bind,consistency=cached"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker",
+        "GitHub.copilot",
+        "GitHub.copilot-chat",
+        "ms-toolsai.jupyter",
+        "ms-toolsai.vscode-jupyter-cell-tags",
+        "ms-toolsai.jupyter-renderers",
+        "ms-toolsai.vscode-jupyter-slideshow",
+        "ms-toolsai.tensorboard",
+        "ms-python.black-formatter",
+        "njpwerner.autodocstring",
+        "charliermarsh.ruff",
+        "visualstudioexptteam.vscodeintellicode",
+        "CucumberOpen.cucumber-official",
+        "matangover.mypy",
+        "ms-vscode.cmake-tools",
+        "ms-vscode-remote.remote-containers",
+        "alefragnani.project-manager",
+        "mechatroner.rainbow-csv",
+        "ms-python.vscode-pylance",
+        "donjayamanne.python-environment-manager"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/envs/ri-ml-base/bin/python",
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": true,
+        "python.linting.ruffEnabled": true,
+        "python.linting.mypyEnabled": true,
+        "python.formatting.provider": "black",
+        "editor.formatOnSave": true,
+        "editor.rulers": [88],
+        "editor.codeActionsOnSave": { "source.organizeImports": "always" },
+        "nvidia-smi-plus.refreshRate": 1,
+        "jupyter.notebookFileRoot": "${containerWorkspaceFolder}"
+      }
+    }
+  },
+  "runArgs": [
+    "--shm-size=64gb",
+    "--ipc=host",
+    "--gpus=all",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt",
+    "seccomp=unconfined",
+    "--ulimit",
+    "memlock=-1",
+    "--ulimit",
+    "stack=67108864"
+  ],
+  "forwardPorts": [8888, 8080],
+  "portsAttributes": {
+    "8888": {
+      "label": "Jupyter",
+      "onAutoForward": "notify"
+    },
+    "8080": {
+      "label": "HTTP",
+      "onAutoForward": "notify"
+    }
+  },
+  "postAttachCommand": "echo 'Welcome to the RI-ML Environment!' && python --version",
+"postCreateCommand": "echo 'Container setup complete. Python environment is being configured...'",
+"shutdownAction": "stopContainer",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "automatic",
+      "userUid": "automatic",
+      "userGid": "automatic",
+      "upgradePackages": "false"
+    }
+  },
+  "waitFor": "updateContentCommand"
+}

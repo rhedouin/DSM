@@ -1,0 +1,35 @@
+# ── Data (downloaded at runtime) ──────────────────────────────
+data/
+data_*/
+tmp/
+DP3.30024.001/
+DTM_data/
+LidarData/
+nu_test*/
+nu_new_test/
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+*.egg
+
+# ── Jupyter ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+Notebooks/tmp_downloads/
+
+# ── OS / IDE ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
+*.swo
+
+# ── Large files that shouldn't be tracked ─────────────────────
+*.tif
+*.jp2
+*.zip
+*.tar.gz
+*.SAFE
