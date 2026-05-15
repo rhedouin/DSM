@@ -1,127 +1,112 @@
-# ---- Configurable build arguments ----
-# Multi-stage Dockerfile for scientific workloads on Azure
-# Each stage builds a main dependency from source for caching, maintainability, and performance.
+FROM nvidia/cuda:12.3.1-base-ubuntu22.04
 
-# Base image configuration
-ARG CUDA_VERSION=12.8.1
-ARG UBUNTU_VERSION=20.04
-ARG BUILD_TYPE=cpu
-# Default base image for CPU builds; GPU builds should pass a CUDA-enabled base explicitly
-ARG BASE_IMAGE=ubuntu:20.04
-ARG INSTALL_GEO_DEPS=true
-ARG INSTALL_HDF5_DEPS=true
+ARG USERNAME=renaud
 
-# --- Stage 1: System dependencies ---
-FROM ${BASE_IMAGE} AS system-deps
+ARG USERNAME
+RUN useradd -m $USERNAME
 
-ARG INSTALL_GEO_DEPS=true
-ARG INSTALL_HDF5_DEPS=true
+# Set the user's home directory as the working directory
+WORKDIR /home/$USERNAME
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+ENV PATH="/home/${USERNAME}/.local/bin:${PATH}"
 
-# Install minimal system packages, geospatial dependencies and GitHub CLI in one layer
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    ca-certificates \
-    gnupg \
-    curl \
-    dirmngr \
-    gnupg2 \
-    && if [ "$INSTALL_GEO_DEPS" = "true" ]; then \
-        apt-get install -y --no-install-recommends \
-        libgdal-dev \
-        libgeos-dev \
-        libproj-dev \
-        libnetcdf-dev \
-        libspatialindex-dev \
-        libcurl4-openssl-dev \
-        libssl-dev \
-    ; fi \
-    && if [ "$INSTALL_HDF5_DEPS" = "true" ]; then \
-        apt-get install -y --no-install-recommends libhdf5-dev \
-    ; fi \
-    && update-ca-certificates \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
-    apt-get update && apt-get install -y --no-install-recommends gh && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+ENV TZ=Europe/London
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Install micromamba for fast, reproducible installs
-RUN wget --quiet https://micro.mamba.pm/api/micromamba/linux-64/latest -O /tmp/micromamba.tar.bz2 && \
-    tar -xjf /tmp/micromamba.tar.bz2 -C /tmp && \
-    mv /tmp/bin/micromamba /usr/local/bin/micromamba && \
-    rm -rf /tmp/*
+# Install packages
+RUN apt-get update && apt-get install -y \
+   build-essential \
+   libffi-dev \
+   libgdbm-dev \
+   libc6-dev \
+   libssl-dev \
+   zlib1g-dev \
+   libbz2-dev \
+   libreadline-dev \
+   libsqlite3-dev \
+   libncurses5-dev \
+   libncursesw5-dev \
+   xz-utils \
+   tk-dev \
+   libxml2-dev \
+   libxmlsec1-dev \
+   liblzma-dev \
+   wget \
+   netcdf-bin \
+   screen \
+   texlive-full
+# New package for Latex paper
 
-# --- Stage 2: Conda environment setup ---
-FROM system-deps AS conda
+# Download and install Python 3.11.8 from source
+ENV PYTHON_VERSION=3.11.8
+RUN wget https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tar.xz && \
+   tar -xf Python-$PYTHON_VERSION.tar.xz && \
+   cd Python-$PYTHON_VERSION && \
+   ./configure --enable-optimizations --enable-shared && \
+   make -j 8 && \
+   make altinstall && \
+   cd ..
 
-# Set conda environment variables
-ENV MAMBA_ROOT_PREFIX=/opt/conda \
-    CONDA_PREFIX=/opt/conda/envs/ri-ml-base \
-    CONDA_DEFAULT_ENV=ri-ml-base
+# Permettre au système de trouver libpython3.11.so au runtime
+# Sans ça, python3.11 crash avec "libpython3.11.so.1.0: cannot open shared object file"
+ENV LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
+RUN ldconfig
 
-# Create conda environment directory
-RUN mkdir -p /opt/conda/envs
+# Remove the Python tarball to reduce image size
+RUN rm Python-$PYTHON_VERSION.tar.xz && \
+   rm -rf Python-$PYTHON_VERSION
 
-# --- Stage 3: Main environment ---
-FROM conda AS env-main
+# Set Python 3.11.8 as the default python
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/local/bin/python3.11 1
 
-# Copy environment files
-COPY .devcontainer/environment.yml /tmp/environment.yml
-COPY .devcontainer/conda-lock.lock* /tmp/
+# # Upgrade pip
+RUN python3.11 -m pip install --upgrade pip
 
-# Create the conda environment
-ARG USE_CONDA_LOCK=auto
-RUN --mount=type=cache,target=/opt/conda/pkgs \
-    set -e && \
-    if [ "$USE_CONDA_LOCK" = "true" ] || { [ "$USE_CONDA_LOCK" = "auto" ] && [ -f /tmp/conda-lock.lock ]; }; then \
-        echo "Using conda lock file for reproducible build"; \
-        micromamba create -n ri-ml-base -f /tmp/conda-lock.lock -y && \
-        echo "Installing pip packages from lock file" && \
-        grep "^# pip" /tmp/conda-lock.lock | sed 's/^# pip //' | xargs -I {} sh -c 'micromamba run -n ri-ml-base pip install "{}"'; \
-    else \
-        echo "Using environment.yml (lock file not available or disabled)"; \
-        micromamba create -n ri-ml-base -f /tmp/environment.yml -y; \
-    fi
+# # Create symlink for pip
+# RUN ln -s /usr/local/bin/pip3.11 /usr/local/bin/pip
 
-# Install libgdal-jp2openjpeg for JP2 support in GDAL
-RUN --mount=type=cache,target=/opt/conda/pkgs \
-    micromamba install -c conda-forge libgdal-jp2openjpeg -y
+# RUN python3.11 -m pip install torch torchvision torchaudio
+RUN python3.11 -m pip install numcodecs --upgrade
+
+RUN apt-get update && \
+    apt-get -y install ncl-ncarg && \
+    apt-get -y install cdo && \
+    apt-get -y install vim && \
+    apt-get -y install r-base r-base-dev
     
-# --- Stage 4: IPython kernel setup ---
-FROM env-main AS ipykernel
+RUN python3.11 -m pip install numpy==1.26.3 
 
-# Install IPython kernel
-RUN --mount=type=cache,target=/opt/conda/pkgs \
-    micromamba run -n ri-ml-base python -m ipykernel install --user --name ri-ml-base --display-name "RI-ML Base"
+RUN python3.11 -m pip install pandas netcdf4 matplotlib seaborn scikit-learn scipy Pyarrow notebook ipython
 
-# --- Stage 5: Runtime environment ---
-FROM ipykernel AS runtime
+# RUN apt-get update && apt-get install -y sudo
 
-# Set PATH and conda environment
-ENV PATH=/opt/conda/envs/ri-ml-base/bin:/opt/conda/bin:${PATH}
+# RUN python3.11 -m pip install neuralhydrology
 
-# Set variant-specific environment variables
-ARG BUILD_VARIANT=cpu-geo
-ENV BUILD_VARIANT=${BUILD_VARIANT}
+RUN python3.11 -m pip install geopandas geemap
 
-# Set CUDA-specific environment variables for GPU builds
-RUN if [ "${BUILD_VARIANT}" != "cpu-geo" ]; then \
-      echo "export CUDA_HOME=/usr/local/cuda" >> /etc/profile.d/cuda.sh && \
-      echo "export NCCL_DEBUG=INFO" >> /etc/profile.d/nccl.sh && \
-      echo "export NCCL_SOCKET_IFNAME=^docker0,lo" >> /etc/profile.d/nccl.sh; \
-    fi
+RUN python3.11 -m pip install --upgrade xclim==0.47.0
 
-# Create cache directories with proper permissions
-RUN mkdir -p /tmp/matplotlib /tmp/jupyter /tmp/cache /tmp/numba && \
-    chmod -R 777 /tmp/matplotlib /tmp/jupyter /tmp/cache /tmp/numba
+RUN python3.11 -m pip install xarray[complete] rioxarray wxee 
 
-# Set working directory
-WORKDIR /workspaces
+RUN python3.11 -m pip install wget 
 
-# Default command
-CMD ["/bin/bash"]
+# RUN python3.11 -m pip install rhealpixdggs DGGSForPoly
+
+RUN python3.11 -m pip install fiona exactextract contextily  
+
+RUN python3.11 -m pip install pathos==0.3.0 multiprocess==0.70.15
+
+# RUN python3.11 -m pip install xgboost 
+
+RUN python3.11 -m pip install numcodecs==0.12.1 zarr==2.18.4 itables cartopy  pyreadr rpy2 prince imblearn
+
+RUN python3.11 -m pip install pymc arviz
+
+RUN python3.11 -m pip install jax[cuda12] numpyro
+
+# RUN python3.11 -m pip install hda
+
+RUN python3.11 -m pip install pystac_client
+
+
+

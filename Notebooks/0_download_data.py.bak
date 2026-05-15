@@ -1,0 +1,309 @@
+"""
+0_download_data.py
+==================
+Downloads all input data and the target for the DSM model:
+
+INPUTS (predictors):
+  1. Sentinel-2 L2A  — bands B02, B03, B04, B08 + NDVI  (10 m, via AWS STAC)
+  2. Copernicus DSM  — global DEM at 30 m                 (via AWS STAC)
+  3. TCD             — Tree Cover Density (20 m, via IGN Geoplateforme WMS)
+  4. IMD             — Imperviousness Degree (20 m, via IGN Geoplateforme WMS)
+
+TARGET:
+  5. DTM Lidar HD    — high-resolution DTM (~50 cm, via IGN Geoplateforme WMS)
+
+All outputs are cropped to the bounding box and saved individually.
+Alignment to a common grid is done in 1_prepare.py.
+"""
+
+import os
+import sys
+import math
+import numpy as np
+import requests
+import rasterio
+from rasterio.windows import from_bounds
+from rasterio.warp import transform_bounds
+from pystac_client import Client
+from pathlib import Path
+
+# Allow access to public COGs on S3 without AWS credentials
+os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
+
+# =============================================================================
+# 1. Parameters
+# =============================================================================
+ZONE = "Caen"
+LON, LAT = -0.37, 49.18            # approximate center
+BOX_SIZE = 0.05                     # degrees (~5 km)
+DATES = "2023-06-01/2023-09-30"     # summer 2023
+MAX_CLOUD_COVER = 5                # %
+
+# OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data"
+
+# Service URLs
+STAC_AWS = "https://earth-search.aws.element84.com/v1"
+WMS_IGN  = "https://data.geopf.fr/wms-r/wms"
+
+# WMS layers (IGN / Geoplateforme)
+LAYER_TCD = "LANDCOVER.HR.TCD.CLC15"                     # tree cover density 2015
+LAYER_IMD = "LANDCOVER.HR.IMD.CLC15"                     # imperviousness 2015
+LAYER_DTM = "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES"     # Lidar HD DTM
+
+# Target WMS resolution (~10 m/pixel)
+WMS_RESOLUTION = 10  # meters
+
+# Sentinel-2 bands
+S2_BANDS = {
+    "blue":  "B02",
+    "green": "B03",
+    "red":   "B04",
+    "nir":   "B08",
+}
+
+# =============================================================================
+# 2. Bounding box and dimensions
+# =============================================================================
+bbox = [LON - BOX_SIZE, LAT - BOX_SIZE, LON + BOX_SIZE, LAT + BOX_SIZE]
+print(f"Zone: {ZONE}")
+print(f"Bbox (WGS84): {bbox}")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Estimate pixel dimensions for WMS requests
+width_km = (bbox[2] - bbox[0]) * 111.0 * math.cos(math.radians(LAT))
+height_km = (bbox[3] - bbox[1]) * 111.0
+width_px = int(width_km * 1000 / WMS_RESOLUTION)
+height_px = int(height_km * 1000 / WMS_RESOLUTION)
+print(f"Estimated WMS dimensions: {width_px} x {height_px} px (~{WMS_RESOLUTION} m)")
+
+
+# =============================================================================
+# 3. Utility functions
+# =============================================================================
+def download_wms(layer, filename, width=None, height=None):
+    """Download a WMS layer from IGN Geoplateforme as GeoTIFF."""
+    w = width or width_px
+    h = height or height_px
+    # WMS 1.3.0 + EPSG:4326 → BBOX = lat_min, lon_min, lat_max, lon_max
+    wms_bbox = f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}"
+
+    print(f"\n--- {filename} ({layer}) ---")
+    print(f"  WMS request: {w}x{h} pixels")
+
+    r = requests.get(WMS_IGN, params={
+        "SERVICE": "WMS",
+        "VERSION": "1.3.0",
+        "REQUEST": "GetMap",
+        "LAYERS": layer,
+        "CRS": "EPSG:4326",
+        "BBOX": wms_bbox,
+        "WIDTH": str(w),
+        "HEIGHT": str(h),
+        "FORMAT": "image/geotiff",
+        "STYLES": "",
+    }, timeout=120)
+
+    if r.status_code != 200 or r.content[:4] not in [b'II*\x00', b'MM\x00*']:
+        print(f"  ERROR: status={r.status_code}")
+        print(f"  Response: {r.text[:300]}")
+        return None
+
+    path = os.path.join(OUTPUT_DIR, f"{filename}_{ZONE.lower()}.tif")
+    with open(path, "wb") as f:
+        f.write(r.content)
+
+    with rasterio.open(path) as src:
+        data = src.read(1)
+        print(f"  Saved: {path}")
+        print(f"  Shape: {data.shape}, CRS: {src.crs}")
+        print(f"  min={np.nanmin(data):.4f}, max={np.nanmax(data):.4f}")
+
+    return path
+
+
+def read_cog_window(href, bbox_wgs84):
+    """Read a window from a remote COG (Cloud Optimized GeoTIFF)."""
+    with rasterio.open(href) as src:
+        src_bounds = transform_bounds("EPSG:4326", src.crs, *bbox_wgs84)
+        window = from_bounds(*src_bounds, transform=src.transform)
+        data = src.read(1, window=window).astype("float32")
+        profile = src.profile.copy()
+        profile.update(
+            width=data.shape[1],
+            height=data.shape[0],
+            transform=src.window_transform(window),
+            driver="GTiff",
+            dtype="float32",
+            compress="deflate",
+        )
+        return data, profile
+
+
+def save_tif(path, data, profile, description=None):
+    """Save a numpy array as a GeoTIFF."""
+    if data.ndim == 2:
+        data = data[np.newaxis, :]
+    profile.update(count=data.shape[0])
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(data)
+        if description and data.shape[0] == 1:
+            dst.set_band_description(1, description)
+    size_kb = os.path.getsize(path) / 1024
+    print(f"  Saved: {path} ({size_kb:.0f} KB)")
+
+
+# =============================================================================
+# 4. Sentinel-2 L2A (via AWS STAC — COGs)
+# =============================================================================
+print("\n" + "=" * 60)
+print("SENTINEL-2 L2A")
+print("=" * 60)
+
+catalog = Client.open(STAC_AWS)
+search = catalog.search(
+    collections=["sentinel-2-l2a"],
+    bbox=bbox,
+    datetime=DATES,
+    query={"eo:cloud_cover": {"lt": MAX_CLOUD_COVER}},
+    sortby=[{"field": "properties.eo:cloud_cover", "direction": "asc"}],
+    limit=10,
+)
+items = list(search.items())
+print(f"Images found: {len(items)}")
+
+if not items:
+    print("ERROR: no Sentinel-2 image found.")
+    sys.exit(1)
+
+item = items[0]
+cloud_cover = item.properties.get("eo:cloud_cover", "?")
+print(f"Selected image: {item.id}")
+print(f"  Date: {item.datetime}, Cloud cover: {cloud_cover}%")
+
+band_arrays = {}
+ref_profile = None
+
+for asset_key, band_name in S2_BANDS.items():
+    asset = item.assets.get(asset_key)
+    if not asset:
+        print(f"  WARNING: asset '{asset_key}' not found")
+        continue
+
+    print(f"\n  Reading {band_name} ({asset_key})...")
+    data, profile = read_cog_window(asset.href, bbox)
+
+    if ref_profile is None:
+        ref_profile = profile
+
+    data = data / 10000.0  # DN → reflectance
+    band_arrays[band_name] = data
+    print(f"    Shape: {data.shape}, min={data.min():.4f}, max={data.max():.4f}")
+
+# NDVI
+nir = band_arrays["B08"]
+red = band_arrays["B04"]
+ndvi = (nir - red) / (nir + red + 1e-8)
+band_arrays["NDVI"] = ndvi
+print(f"\n  NDVI: min={ndvi.min():.4f}, max={ndvi.max():.4f}")
+
+# Stack and save
+band_order = ["B02", "B03", "B04", "B08", "NDVI"]
+stack = np.stack([band_arrays[b] for b in band_order], axis=0)
+s2_path = os.path.join(OUTPUT_DIR, f"sentinel2_{ZONE.lower()}.tif")
+ref_profile.update(count=len(band_order))
+with rasterio.open(s2_path, "w", **ref_profile) as dst:
+    dst.write(stack)
+    for i, name in enumerate(band_order):
+        dst.set_band_description(i + 1, name)
+print(f"\n  Sentinel-2 → {s2_path}")
+print(f"  {stack.shape[0]} bands: {band_order}")
+print(f"  CRS: {ref_profile['crs']}, Size: {stack.shape[1]}x{stack.shape[2]}")
+
+
+# =============================================================================
+# 5. Copernicus DEM 30 m (via AWS STAC)
+# =============================================================================
+print("\n" + "=" * 60)
+print("COPERNICUS DEM 30 m")
+print("=" * 60)
+
+dem_search = catalog.search(
+    collections=["cop-dem-glo-30"],
+    bbox=bbox,
+    limit=10,
+)
+dem_items = list(dem_search.items())
+print(f"DEM tiles found: {len(dem_items)}")
+
+if not dem_items:
+    print("ERROR: no DEM tile found.")
+    sys.exit(1)
+
+dem_item = dem_items[0]
+print(f"Tile: {dem_item.id}")
+dem_href = dem_item.assets["data"].href
+print(f"  URL: {dem_href[:100]}...")
+
+dem_data, dem_profile = read_cog_window(dem_href, bbox)
+dem_path = os.path.join(OUTPUT_DIR, f"copdem30_{ZONE.lower()}.tif")
+save_tif(dem_path, dem_data, dem_profile, description="COP-DEM-30m")
+print(f"  Shape: {dem_data.shape}, min={dem_data.min():.2f} m, max={dem_data.max():.2f} m")
+
+
+# =============================================================================
+# 6. TCD — Tree Cover Density (via WMS Geoplateforme)
+# =============================================================================
+print("\n" + "=" * 60)
+print("TCD — TREE COVER DENSITY")
+print("=" * 60)
+
+tcd_path = download_wms(LAYER_TCD, "tcd")
+
+
+# =============================================================================
+# 7. IMD — Imperviousness Degree (via WMS Geoplateforme)
+# =============================================================================
+print("\n" + "=" * 60)
+print("IMD — IMPERVIOUSNESS DEGREE")
+print("=" * 60)
+
+imd_path = download_wms(LAYER_IMD, "imd")
+
+
+# =============================================================================
+# 8. DTM Lidar HD — Target (via WMS Geoplateforme)
+# =============================================================================
+print("\n" + "=" * 60)
+print("DTM LIDAR HD — TARGET (high-resolution DTM)")
+print("=" * 60)
+
+dtm_path = download_wms(LAYER_DTM, "dtm_lidar")
+
+
+# =============================================================================
+# 9. Summary
+# =============================================================================
+print("\n" + "=" * 60)
+print("DOWNLOADED FILES SUMMARY")
+print("=" * 60)
+
+files = {
+    "Sentinel-2 (B02,B03,B04,B08,NDVI)": s2_path,
+    "Copernicus DEM 30 m":               dem_path,
+    "TCD (tree cover density)":          tcd_path,
+    "IMD (imperviousness)":              imd_path,
+    "DTM Lidar HD (target)":             dtm_path,
+}
+
+for name, path in files.items():
+    if path and os.path.exists(path):
+        size_kb = os.path.getsize(path) / 1024
+        with rasterio.open(path) as src:
+            print(f"  {name:45s} → {src.width}x{src.height}, {src.count} band(s), {size_kb:.0f} KB")
+    else:
+        print(f"  {name:45s} → MISSING")
+
+print(f"\nOutput directory: {OUTPUT_DIR}")
+print("Done!")
