@@ -1,603 +1,500 @@
 """
 1_prepare.py
 ============
-Aligns all inputs to the Sentinel-2 reference grid (EPSG:32630, 10 m)
-and generates visualizations:
-  - output/original/   → raw images as downloaded
-  - output/aligned/    → inputs reprojected to the same grid
-  - the target (DTM Lidar HD) is kept as-is for now
+Reprojects and aligns all raw inputs to the Sentinel-2 reference grid for
+every zone, then generates diagnostic plots.
 
-Inputs (in data/):
-  sentinel2_caen.tif   — 5 bands (B02, B03, B04, B08, NDVI), EPSG:32630, 10 m
-  copdem30_caen.tif    — 1 band, EPSG:4326, ~30 m
-  tcd_caen.tif         — 4 bands RGBA (WMS render), EPSG:4326, ~10 m
-  imd_caen.tif         — 4 bands RGBA (WMS render), EPSG:4326, ~10 m
-  dtm_lidar_caen.tif   — 1 band, EPSG:4326, ~10 m
+For each zone the following aligned files are saved under
+  data/aligned/{zone_id}/:
+  sentinel2.tif   -- 5 bands (B02, B03, B04, B08, NDVI) -- reference grid
+  copdem30.tif    -- COP-DEM 30 m bilinearly resampled to 10 m
+  slope.tif       -- terrain slope (degrees) derived from aligned COP-DEM
+  tcd.tif         -- TCD greyscale proxy (0-255, derived from RGBA WMS render)
+  imd.tif         -- IMD greyscale proxy (0-255, derived from RGBA WMS render)
+  dtm_lidar.tif   -- Lidar HD DTM bilinearly resampled to 10 m  [TARGET]
 
-Outputs (in data/):
-  aligned_sentinel2.tif  — already on the right grid, copied as-is
-  aligned_copdem30.tif   — reprojected + resampled to 10 m
-  aligned_tcd.tif        — reprojected, band 1 only (greyscale from render)
-  aligned_imd.tif        — reprojected, band 1 only
-  dtm_lidar_caen.tif     — unchanged (target)
+All outputs share the exact same CRS, transform, width, and height as the
+corresponding zone's Sentinel-2 image (auto-detected from data/zones/{id}/).
+
+Usage
+-----
+  python 1_prepare.py                         # prepare all zones
+  python 1_prepare.py --zones caen grenoble   # specific zones only
 """
 
-import os
+from __future__ import annotations
+
+import argparse
 import sys
-import shutil
-import numpy as np
-import rasterio
-from rasterio.warp import reproject, Resampling, calculate_default_transform
-from rasterio.crs import CRS
+from pathlib import Path
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pathlib import Path
-
-# =============================================================================
-# 1. Paths
-# =============================================================================
-BASE_DIR = Path(__file__).resolve().parent.parent 
-DATA_DIR = BASE_DIR / "data"
-
-OUTPUT_DIR   = BASE_DIR / "output"
-ORIGINAL_DIR = OUTPUT_DIR / "original"
-ALIGNED_DIR  = OUTPUT_DIR / "aligned"
-
-ORIGINAL_DIR.mkdir(parents=True, exist_ok=True)
-ALIGNED_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-ZONE = "caen"
-
-FILES = {
-    "sentinel2": DATA_DIR / f"sentinel2_{ZONE}.tif",
-    "copdem30":  DATA_DIR / f"copdem30_{ZONE}.tif",
-    "tcd":       DATA_DIR / f"tcd_{ZONE}.tif",
-    "imd":       DATA_DIR / f"imd_{ZONE}.tif",
-    "dtm_lidar": DATA_DIR / f"dtm_lidar_{ZONE}.tif",
-}
-
-# Check that all files exist
-for name, path in FILES.items():
-    if not path.exists():
-        print(f"ERROR: missing file — {path}")
-        sys.exit(1)
-
-# =============================================================================
-# 2. Reference grid (Sentinel-2)
-# =============================================================================
-print("=" * 60)
-print("REFERENCE GRID (Sentinel-2)")
-print("=" * 60)
-
-with rasterio.open(FILES["sentinel2"]) as src_ref:
-    REF_CRS = src_ref.crs
-    REF_TRANSFORM = src_ref.transform
-    REF_WIDTH = src_ref.width
-    REF_HEIGHT = src_ref.height
-    REF_BOUNDS = src_ref.bounds
-
-print(f"  CRS:        {REF_CRS}")
-print(f"  Size:       {REF_WIDTH} x {REF_HEIGHT}")
-print(f"  Resolution: {REF_TRANSFORM.a:.1f} m")
-print(f"  Bounds:     {REF_BOUNDS}")
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.warp import calculate_default_transform, reproject
 
 
-# =============================================================================
-# 3. Functions
-# =============================================================================
-def reproject_to_grid(input_path, output_path, band=None,
-                      resampling=Resampling.bilinear):
-    """Reproject a raster to the Sentinel-2 reference grid."""
-    with rasterio.open(input_path) as src:
-        n_bands = 1 if band else src.count
-        band_indices = [band] if band else list(range(1, src.count + 1))
+# ---------------------------------------------------------------------------
+# 1.  Geometry helpers
+# ---------------------------------------------------------------------------
 
-        dst_profile = src.profile.copy()
-        dst_profile.update(
-            crs=REF_CRS,
-            transform=REF_TRANSFORM,
-            width=REF_WIDTH,
-            height=REF_HEIGHT,
-            count=n_bands,
-            dtype="float32",
-            driver="GTiff",
-            compress="deflate",
-            nodata=np.nan,
+def get_reference_grid(s2_path: Path) -> dict:
+    """
+    Extract CRS, transform, width, height from the Sentinel-2 file.
+    All other layers will be reprojected to match this grid.
+    """
+    with rasterio.open(s2_path) as src:
+        return dict(
+            crs       = src.crs,
+            transform = src.transform,
+            width     = src.width,
+            height    = src.height,
         )
 
-        with rasterio.open(output_path, "w", **dst_profile) as dst:
-            for i, idx in enumerate(band_indices, start=1):
-                src_data = src.read(idx).astype("float32")
-                # Handle nodata
-                if src.nodata is not None:
-                    src_data[src_data == src.nodata] = np.nan
 
-                dst_data = np.full((REF_HEIGHT, REF_WIDTH), np.nan, dtype="float32")
+def reproject_to_grid(input_path: Path, output_path: Path,
+                      grid: dict, band: int = 1,
+                      resampling: Resampling = Resampling.bilinear,
+                      nodata: float = np.nan) -> None:
+    """
+    Reproject a single band from input_path to match a reference grid.
 
-                reproject(
-                    source=src_data,
-                    destination=dst_data,
-                    src_transform=src.transform,
-                    src_crs=src.crs if src.crs else CRS.from_epsg(4326),
-                    dst_transform=REF_TRANSFORM,
-                    dst_crs=REF_CRS,
-                    resampling=resampling,
-                    src_nodata=np.nan,
-                    dst_nodata=np.nan,
-                )
-                dst.write(dst_data, i)
-
-    with rasterio.open(output_path) as src:
-        d = src.read(1)
-        valid = np.isfinite(d)
-        print(f"  → {output_path}")
-        print(f"    Shape: {src.width}x{src.height}, {src.count} band(s)")
-        print(f"    min={np.nanmin(d):.4f}, max={np.nanmax(d):.4f}, "
-              f"NaN={np.sum(~valid)} ({100*np.sum(~valid)/d.size:.1f}%)")
-
-    return output_path
-
-
-def reproject_rgba_wms(input_path, output_path,
-                       resampling=Resampling.nearest):
-    """Reproject an RGBA raster from WMS.
-
-    Converts the 3 RGB bands to greyscale (luminance),
-    uses the alpha channel (band 4) as mask (alpha==0 → NaN).
+    Parameters
+    ----------
+    input_path : source raster (any CRS / resolution)
+    output_path: destination GeoTIFF
+    grid       : dict with keys crs, transform, width, height
+    band       : band index to read (1-based)
+    resampling : rasterio Resampling method
+    nodata     : nodata value for the output
     """
     with rasterio.open(input_path) as src:
-        r = src.read(1).astype("float32")
-        g = src.read(2).astype("float32")
-        b = src.read(3).astype("float32")
-        alpha = src.read(4) if src.count >= 4 else np.full_like(r, 255, dtype="uint8")
-
-        # Greyscale via luminance
-        grey = 0.299 * r + 0.587 * g + 0.114 * b
-
-        # Mask transparent pixels
-        grey[alpha == 0] = np.nan
-
-        dst_profile = src.profile.copy()
-        dst_profile.update(
-            crs=REF_CRS,
-            transform=REF_TRANSFORM,
-            width=REF_WIDTH,
-            height=REF_HEIGHT,
-            count=1,
-            dtype="float32",
-            driver="GTiff",
-            compress="deflate",
-            nodata=np.nan,
-        )
-
-        dst_data = np.full((REF_HEIGHT, REF_WIDTH), np.nan, dtype="float32")
-
+        dst_arr = np.full((grid["height"], grid["width"]), np.nan, dtype="float32")
         reproject(
-            source=grey,
-            destination=dst_data,
-            src_transform=src.transform,
-            src_crs=src.crs if src.crs else CRS.from_epsg(4326),
-            dst_transform=REF_TRANSFORM,
-            dst_crs=REF_CRS,
-            resampling=resampling,
-            src_nodata=np.nan,
-            dst_nodata=np.nan,
+            source      = rasterio.band(src, band),
+            destination = dst_arr,
+            src_transform = src.transform,
+            src_crs       = src.crs,
+            dst_transform = grid["transform"],
+            dst_crs       = grid["crs"],
+            resampling    = resampling,
+            src_nodata    = src.nodata,
+            dst_nodata    = nodata,
         )
-
-        with rasterio.open(output_path, "w", **dst_profile) as dst:
-            dst.write(dst_data, 1)
-
-    with rasterio.open(output_path) as src:
-        d = src.read(1)
-        valid = np.isfinite(d)
-        print(f"  → {output_path}")
-        print(f"    Shape: {src.width}x{src.height}, {src.count} band(s)")
-        print(f"    min={np.nanmin(d):.4f}, max={np.nanmax(d):.4f}, "
-              f"NaN={np.sum(~valid)} ({100*np.sum(~valid)/d.size:.1f}%)")
-
-    return output_path
-
-
-def plot_raster(path, title, fig_path, band=1, cmap="terrain",
-                vmin=None, vmax=None, nodata_val=None):
-    """Generate a PNG figure for a single-band raster."""
-    with rasterio.open(path) as src:
-        data = src.read(band).astype("float32")
-        if src.nodata is not None:
-            data[data == src.nodata] = np.nan
-        if nodata_val is not None:
-            data[data == nodata_val] = np.nan
-
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax)
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel("Column (pixel)")
-    ax.set_ylabel("Row (pixel)")
-    plt.colorbar(im, ax=ax, shrink=0.7, label="Value")
-    plt.tight_layout()
-    plt.savefig(fig_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Figure: {fig_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = dict(
+        driver    = "GTiff",
+        dtype     = "float32",
+        count     = 1,
+        crs       = grid["crs"],
+        transform = grid["transform"],
+        width     = grid["width"],
+        height    = grid["height"],
+        compress  = "deflate",
+        nodata    = nodata,
+    )
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(dst_arr, 1)
 
 
-def plot_rgb(path, title, fig_path, bands=(3, 2, 1), stretch=3.0):
-    """Generate an RGB composite figure for Sentinel-2 (R=B04, G=B03, B=B02)."""
-    with rasterio.open(path) as src:
-        rgb = np.stack([src.read(b).astype("float32") for b in bands], axis=-1)
+def reproject_rgba_wms(input_path: Path, output_path: Path,
+                       grid: dict) -> None:
+    """
+    Reproject a 4-band RGBA WMS render to the reference grid.
 
-    # Stretch for visualization
-    rgb = np.clip(rgb * stretch, 0, 1)
+    Converts the colourised RGBA image to a greyscale luminance proxy:
+        L = 0.299*R + 0.587*G + 0.114*B,  scaled to [0, 1]
+    Pixels where alpha=0 (no data) are set to NaN.
 
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    ax.imshow(rgb)
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel("Column (pixel)")
-    ax.set_ylabel("Row (pixel)")
-    plt.tight_layout()
-    plt.savefig(fig_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Figure: {fig_path}")
+    Note: This is an approximation of the underlying TCD/IMD values since
+    the WMS only exposes a visualisation, not raw numeric rasters.  The
+    luminance preserves the relative ordering of values in the colour ramp.
+    """
+    with rasterio.open(input_path) as src:
+        if src.count < 3:
+            # Fallback: treat as single-band
+            reproject_to_grid(input_path, output_path, grid)
+            return
+
+        # Read RGBA into destination CRS directly
+        rgba_dst = np.zeros((src.count, grid["height"], grid["width"]), dtype="float32")
+        for b in range(1, src.count + 1):
+            reproject(
+                source        = rasterio.band(src, b),
+                destination   = rgba_dst[b - 1],
+                src_transform = src.transform,
+                src_crs       = src.crs,
+                dst_transform = grid["transform"],
+                dst_crs       = grid["crs"],
+                resampling    = Resampling.bilinear,
+                src_nodata    = src.nodata,
+                dst_nodata    = 0.0,
+            )
+
+    r, g, b_ch = rgba_dst[0], rgba_dst[1], rgba_dst[2]
+    alpha = rgba_dst[3] if rgba_dst.shape[0] >= 4 else None
+
+    grey = (0.299 * r + 0.587 * g + 0.114 * b_ch) / 255.0   # [0, 1]
+    if alpha is not None:
+        grey[alpha < 1] = np.nan    # transparent = no data
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = dict(
+        driver    = "GTiff",
+        dtype     = "float32",
+        count     = 1,
+        crs       = grid["crs"],
+        transform = grid["transform"],
+        width     = grid["width"],
+        height    = grid["height"],
+        compress  = "deflate",
+        nodata    = np.nan,
+    )
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(grey, 1)
 
 
-def plot_rgba_wms(path, title, fig_path):
-    """Generate a figure for an RGBA raster from WMS."""
-    with rasterio.open(path) as src:
-        if src.count >= 3:
-            rgb = np.stack([src.read(b) for b in [1, 2, 3]], axis=-1)
+def reproject_multiband(input_path: Path, output_path: Path,
+                        grid: dict,
+                        resampling: Resampling = Resampling.bilinear) -> None:
+    """
+    Reproject all bands of a multi-band raster to the reference grid.
+    Used for Sentinel-2 (5 bands).
+    """
+    with rasterio.open(input_path) as src:
+        n_bands = src.count
+        dst_arr = np.zeros((n_bands, grid["height"], grid["width"]), dtype="float32")
+        band_names = [src.descriptions[i] or f"band_{i+1}" for i in range(n_bands)]
+
+        for b in range(1, n_bands + 1):
+            reproject(
+                source        = rasterio.band(src, b),
+                destination   = dst_arr[b - 1],
+                src_transform = src.transform,
+                src_crs       = src.crs,
+                dst_transform = grid["transform"],
+                dst_crs       = grid["crs"],
+                resampling    = resampling,
+                src_nodata    = src.nodata,
+                dst_nodata    = np.nan,
+            )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = dict(
+        driver    = "GTiff",
+        dtype     = "float32",
+        count     = n_bands,
+        crs       = grid["crs"],
+        transform = grid["transform"],
+        width     = grid["width"],
+        height    = grid["height"],
+        compress  = "deflate",
+    )
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(dst_arr)
+        for i, name in enumerate(band_names, 1):
+            dst.set_band_description(i, name)
+
+
+# ---------------------------------------------------------------------------
+# 2.  Slope computation
+# ---------------------------------------------------------------------------
+
+def compute_slope(dem: np.ndarray, resolution_m: float = 10.0) -> np.ndarray:
+    """
+    Compute terrain slope in degrees from a 2-D DEM (float32, NaN = nodata).
+
+    Uses numpy gradient (central differences) with the cell size in metres.
+    NaN cells in the input yield NaN in the output.
+    """
+    valid  = np.isfinite(dem)
+    filled = dem.copy()
+    if not valid.all():
+        # Fill NaN with global mean for gradient computation (border artefacts
+        # are masked back to NaN afterwards)
+        filled[~valid] = float(np.nanmean(filled))
+
+    dy, dx = np.gradient(filled, resolution_m, resolution_m)
+    slope  = np.degrees(np.arctan(np.sqrt(dx ** 2 + dy ** 2)))
+    slope  = slope.astype("float32")
+    slope[~valid] = np.nan      # restore nodata
+    return slope
+
+
+# ---------------------------------------------------------------------------
+# 3.  Visualisation helpers
+# ---------------------------------------------------------------------------
+
+def _plot_raster(ax: plt.Axes, data: np.ndarray, title: str,
+                 cmap: str = "terrain", unit: str = "") -> None:
+    valid = data[np.isfinite(data)]
+    vmin  = float(np.percentile(valid, 2))  if valid.size else 0
+    vmax  = float(np.percentile(valid, 98)) if valid.size else 1
+    im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="equal")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=unit)
+    ax.set_title(title, fontsize=9)
+    ax.axis("off")
+
+
+def _plot_rgb(ax: plt.Axes, stack: np.ndarray, title: str,
+              bands: tuple[int, int, int] = (2, 1, 0)) -> None:
+    """Display a false/true colour composite from a (C, H, W) stack."""
+    rgb = stack[list(bands)].transpose(1, 2, 0)
+    # Robust stretch per channel
+    out = np.zeros_like(rgb)
+    for c in range(3):
+        ch   = rgb[:, :, c]
+        lo   = float(np.nanpercentile(ch, 2))
+        hi   = float(np.nanpercentile(ch, 98))
+        out[:, :, c] = np.clip((ch - lo) / (hi - lo + 1e-8), 0, 1)
+    ax.imshow(out, aspect="equal")
+    ax.set_title(title, fontsize=9)
+    ax.axis("off")
+
+
+# ---------------------------------------------------------------------------
+# 4.  Per-zone preparation pipeline
+# ---------------------------------------------------------------------------
+
+def prepare_zone(zone_id: str, data_root: Path, output_root: Path,
+                 verbose: bool = True) -> bool:
+    """
+    Align all raw inputs for one zone to the Sentinel-2 reference grid.
+
+    Returns True on success, False if mandatory files are missing.
+    """
+    raw_dir     = data_root  / "zones"   / zone_id
+    aligned_dir = data_root  / "aligned" / zone_id
+    fig_dir     = output_root / "zones"  / zone_id
+    aligned_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    s2_raw = raw_dir / "sentinel2.tif"
+    if not s2_raw.exists():
+        print(f"  ERROR: {s2_raw} not found -- run 0_download_data.py first")
+        return False
+
+    if verbose:
+        print(f"\n[1] Reference grid from {s2_raw.name}")
+    grid = get_reference_grid(s2_raw)
+    res  = abs(grid["transform"].a)   # pixel size in metres (CRS units)
+    if verbose:
+        print(f"  CRS: {grid['crs']}  size: {grid['width']}x{grid['height']}  "
+              f"res: {res:.1f} m/px")
+
+    # ------------------------------------------------------------------ #
+    # Sentinel-2 (reproject all 5 bands in one pass)                     #
+    # ------------------------------------------------------------------ #
+    s2_aligned = aligned_dir / "sentinel2.tif"
+    if verbose:
+        print(f"[2] Aligning Sentinel-2 ...")
+    reproject_multiband(s2_raw, s2_aligned, grid)
+    if verbose:
+        print(f"  -> {s2_aligned.name}")
+
+    # ------------------------------------------------------------------ #
+    # COP-DEM 30 m                                                        #
+    # ------------------------------------------------------------------ #
+    dem_raw     = raw_dir     / "copdem30.tif"
+    dem_aligned = aligned_dir / "copdem30.tif"
+    if dem_raw.exists():
+        if verbose:
+            print("[3] Aligning COP-DEM ...")
+        reproject_to_grid(dem_raw, dem_aligned, grid, resampling=Resampling.bilinear)
+        if verbose:
+            print(f"  -> {dem_aligned.name}")
+    else:
+        print(f"  WARNING: {dem_raw} not found -- skipping COP-DEM")
+
+    # ------------------------------------------------------------------ #
+    # Slope (derived from aligned COP-DEM)                               #
+    # ------------------------------------------------------------------ #
+    slope_aligned = aligned_dir / "slope.tif"
+    if dem_aligned.exists():
+        if verbose:
+            print("[4] Computing slope ...")
+        with rasterio.open(dem_aligned) as src:
+            dem_arr = src.read(1).astype("float32")
+            dem_arr[dem_arr == src.nodata] = np.nan
+        slope_arr = compute_slope(dem_arr, resolution_m=res)
+        profile   = dict(
+            driver="GTiff", dtype="float32", count=1,
+            crs=grid["crs"], transform=grid["transform"],
+            width=grid["width"], height=grid["height"],
+            compress="deflate", nodata=np.nan,
+        )
+        with rasterio.open(slope_aligned, "w", **profile) as dst:
+            dst.write(slope_arr, 1)
+            dst.set_band_description(1, "slope_deg")
+        if verbose:
+            valid_slope = slope_arr[np.isfinite(slope_arr)]
+            print(f"  -> {slope_aligned.name}  "
+                  f"range [{valid_slope.min():.1f}, {valid_slope.max():.1f}] deg")
+
+    # ------------------------------------------------------------------ #
+    # TCD and IMD  (RGBA WMS -> greyscale luminance)                     #
+    # ------------------------------------------------------------------ #
+    for layer_name in ("tcd", "imd"):
+        raw_path     = raw_dir     / f"{layer_name}.tif"
+        aligned_path = aligned_dir / f"{layer_name}.tif"
+        if raw_path.exists():
+            if verbose:
+                print(f"[{'5' if layer_name=='tcd' else '6'}] Aligning {layer_name.upper()} ...")
+            reproject_rgba_wms(raw_path, aligned_path, grid)
+            if verbose:
+                print(f"  -> {aligned_path.name}")
         else:
-            rgb = src.read(1)
+            print(f"  WARNING: {raw_path} not found -- skipping {layer_name.upper()}")
 
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    ax.imshow(rgb)
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel("Column (pixel)")
-    ax.set_ylabel("Row (pixel)")
+    # ------------------------------------------------------------------ #
+    # DTM Lidar HD (TARGET)                                               #
+    # ------------------------------------------------------------------ #
+    dtm_raw     = raw_dir     / "dtm_lidar.tif"
+    dtm_aligned = aligned_dir / "dtm_lidar.tif"
+    if dtm_raw.exists():
+        if verbose:
+            print("[7] Aligning Lidar HD DTM (target) ...")
+        with rasterio.open(dtm_raw) as src:
+            n_bands = src.count
+        # Single or multi-band: use band 1
+        reproject_to_grid(dtm_raw, dtm_aligned, grid,
+                          resampling=Resampling.bilinear, nodata=np.nan)
+        if verbose:
+            with rasterio.open(dtm_aligned) as src:
+                arr = src.read(1)
+                valid = arr[np.isfinite(arr)]
+                print(f"  -> {dtm_aligned.name}  "
+                      f"range [{valid.min():.1f}, {valid.max():.1f}] m")
+    else:
+        print(f"  WARNING: {dtm_raw} not found -- target missing")
+
+    # ------------------------------------------------------------------ #
+    # Diagnostic figures                                                  #
+    # ------------------------------------------------------------------ #
+    if verbose:
+        print("[8] Generating plots ...")
+    _make_plots(zone_id, aligned_dir, fig_dir)
+    if verbose:
+        print(f"  Figures saved to {fig_dir}/")
+
+    return True
+
+
+def _make_plots(zone_id: str, aligned_dir: Path, fig_dir: Path) -> None:
+    """Generate a 2-row overview figure for one zone."""
+    layers = [
+        ("sentinel2.tif",  None,           "S2 RGB (B04/B03/B02)",  "viridis", ""),
+        ("copdem30.tif",   None,           "COP-DEM 30m (m)",       "terrain", "m"),
+        ("slope.tif",      None,           "Slope (deg)",            "hot_r",   "deg"),
+        ("tcd.tif",        None,           "TCD proxy",              "Greens",  "luminance"),
+        ("imd.tif",        None,           "IMD proxy",              "Reds",    "luminance"),
+        ("dtm_lidar.tif",  None,           "DTM Lidar HD (m)",       "terrain", "m"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+    fig.suptitle(f"Zone: {zone_id}  — aligned to Sentinel-2 grid", fontsize=12)
+    axes_flat = axes.ravel()
+
+    for ax, (fname, _, title, cmap, unit) in zip(axes_flat, layers):
+        p = aligned_dir / fname
+        if not p.exists():
+            ax.set_title(f"{title}\n(missing)", fontsize=9)
+            ax.axis("off")
+            continue
+        with rasterio.open(p) as src:
+            data = src.read(1).astype("float32")
+            # Mark nodata
+            if src.nodata is not None:
+                data[data == src.nodata] = np.nan
+
+        if fname == "sentinel2.tif":
+            with rasterio.open(aligned_dir / fname) as src:
+                stack = src.read().astype("float32")
+            # Band order: B02=0, B03=1, B04=2, B08=3, NDVI=4
+            _plot_rgb(ax, stack, title, bands=(2, 1, 0))   # RGB true colour
+        else:
+            _plot_raster(ax, data, title, cmap=cmap, unit=unit)
+
     plt.tight_layout()
-    plt.savefig(fig_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Figure: {fig_path}")
+    out_path = fig_dir / "overview_aligned.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Residual: DTM_lidar - COP-DEM
+    dtm_p  = aligned_dir / "dtm_lidar.tif"
+    dem_p  = aligned_dir / "copdem30.tif"
+    if dtm_p.exists() and dem_p.exists():
+        with rasterio.open(dtm_p) as s1, rasterio.open(dem_p) as s2:
+            dtm = s1.read(1).astype("float32")
+            dem = s2.read(1).astype("float32")
+        if s1.nodata is not None:
+            dtm[dtm == s1.nodata] = np.nan
+        if s2.nodata is not None:
+            dem[dem == s2.nodata] = np.nan
+        residual = dtm - dem
+        fig2, ax2 = plt.subplots(figsize=(6, 5))
+        _plot_raster(ax2, residual,
+                     f"{zone_id}: DTM_lidar - COP-DEM 30m (m)",
+                     cmap="RdBu_r", unit="m")
+        fig2.savefig(fig_dir / "residual_dtm_vs_copedem.png", dpi=150,
+                     bbox_inches="tight")
+        plt.close(fig2)
 
 
-# =============================================================================
-# 4. Visualizations — ORIGINAL data
-# =============================================================================
-print("\n" + "=" * 60)
-print("FIGURES — ORIGINAL DATA")
-print("=" * 60)
+# ---------------------------------------------------------------------------
+# 5.  Entry point
+# ---------------------------------------------------------------------------
 
-# Sentinel-2 RGB
-print("\n--- Sentinel-2 (RGB composite) ---")
-plot_rgb(
-    FILES["sentinel2"],
-    "Sentinel-2 L2A — RGB (original)",
-    os.path.join(ORIGINAL_DIR, "sentinel2_rgb.png"),
-    bands=(3, 2, 1), stretch=3.0,
-)
-
-# Sentinel-2 NDVI
-print("\n--- Sentinel-2 NDVI ---")
-plot_raster(
-    FILES["sentinel2"],
-    "Sentinel-2 — NDVI (original)",
-    os.path.join(ORIGINAL_DIR, "sentinel2_ndvi.png"),
-    band=5, cmap="RdYlGn", vmin=-0.2, vmax=0.9,
-)
-
-# Copernicus DEM
-print("\n--- Copernicus DEM 30 m ---")
-plot_raster(
-    FILES["copdem30"],
-    "Copernicus DEM 30 m (original)",
-    os.path.join(ORIGINAL_DIR, "copdem30.png"),
-    cmap="terrain",
-)
-
-# TCD (WMS RGBA render)
-print("\n--- TCD (WMS render) ---")
-plot_rgba_wms(
-    FILES["tcd"],
-    "TCD — Tree Cover Density (WMS render, original)",
-    os.path.join(ORIGINAL_DIR, "tcd.png"),
-)
-
-# IMD (WMS RGBA render)
-print("\n--- IMD (WMS render) ---")
-plot_rgba_wms(
-    FILES["imd"],
-    "IMD — Imperviousness (WMS render, original)",
-    os.path.join(ORIGINAL_DIR, "imd.png"),
-)
-
-# DTM Lidar HD
-print("\n--- DTM Lidar HD (target) ---")
-plot_raster(
-    FILES["dtm_lidar"],
-    "DTM Lidar HD — high-resolution DTM (target)",
-    os.path.join(ORIGINAL_DIR, "dtm_lidar.png"),
-    cmap="terrain", nodata_val=-99999.0,
-)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Align and prepare DSM/DTM zone data for model training."
+    )
+    parser.add_argument(
+        "--zones", nargs="*", metavar="ZONE_ID",
+        help="Zone IDs to prepare (default: all).",
+    )
+    return parser.parse_args()
 
 
-# =============================================================================
-# 5. Alignment to Sentinel-2 grid
-# =============================================================================
-print("\n" + "=" * 60)
-print("ALIGNMENT TO SENTINEL-2 GRID")
-print("=" * 60)
+def main():
+    from zones import ZONES, ZONES_BY_ID
 
-# 5a. Sentinel-2 — already on the right grid, just copy
-print("\n--- Sentinel-2 (already aligned) ---")
-s2_aligned_path = os.path.join(DATA_DIR, "aligned_sentinel2.tif")
-shutil.copy2(FILES["sentinel2"], s2_aligned_path)
-print(f"  → {s2_aligned_path} (copy)")
+    args = parse_args()
 
-# 5b. Copernicus DEM → reprojected to EPSG:32630, 10 m
-print("\n--- Copernicus DEM 30 m → 10 m UTM ---")
-dem_aligned_path = os.path.join(DATA_DIR, "aligned_copdem30.tif")
-reproject_to_grid(
-    FILES["copdem30"], dem_aligned_path,
-    resampling=Resampling.bilinear,
-)
+    if args.zones:
+        unknown = set(args.zones) - set(ZONES_BY_ID.keys())
+        if unknown:
+            print(f"ERROR: unknown zone ID(s): {sorted(unknown)}")
+            sys.exit(1)
+        selected = [ZONES_BY_ID[zid] for zid in args.zones]
+    else:
+        selected = ZONES
 
-# 5c. TCD — RGBA from WMS → greyscale with alpha mask
-# Note: the WMS returns a color render (RGBA), not raw values.
-# We convert RGB → greyscale and use the alpha channel as mask.
-print("\n--- TCD → reprojected greyscale ---")
-tcd_aligned_path = os.path.join(DATA_DIR, "aligned_tcd.tif")
-reproject_rgba_wms(
-    FILES["tcd"], tcd_aligned_path,
-    resampling=Resampling.nearest,
-)
+    data_root   = Path(__file__).resolve().parent.parent / "data"
+    output_root = Path(__file__).resolve().parent.parent / "output"
 
-# 5d. IMD — same approach
-print("\n--- IMD → reprojected greyscale ---")
-imd_aligned_path = os.path.join(DATA_DIR, "aligned_imd.tif")
-reproject_rgba_wms(
-    FILES["imd"], imd_aligned_path,
-    resampling=Resampling.nearest,
-)
+    print(f"\nPreparing {len(selected)} zone(s)")
+    print(f"  Raw data   : {data_root}/zones/")
+    print(f"  Aligned    : {data_root}/aligned/")
+    print(f"  Figures    : {output_root}/zones/")
 
-# 5e. DTM Lidar — kept as-is (this is the target)
-print("\n--- DTM Lidar HD — kept as-is (target) ---")
-print(f"  → {FILES['dtm_lidar']} (unchanged)")
+    ok_count = 0
+    for zone in selected:
+        zone_id = zone["id"]
+        print(f"\n{'=' * 64}")
+        print(f"  ZONE: {zone['name']}  [{zone_id}]")
+        print(f"{'=' * 64}")
+        success = prepare_zone(zone_id, data_root, output_root, verbose=True)
+        if success:
+            ok_count += 1
+
+    print(f"\nDone: {ok_count}/{len(selected)} zones prepared successfully.")
+    if ok_count < len(selected):
+        print("  Run 0_download_data.py first for missing zones.")
 
 
-# =============================================================================
-# 6. Visualizations — ALIGNED data
-# =============================================================================
-print("\n" + "=" * 60)
-print("FIGURES — ALIGNED DATA")
-print("=" * 60)
-
-# Sentinel-2 RGB
-print("\n--- Sentinel-2 aligned (RGB) ---")
-plot_rgb(
-    s2_aligned_path,
-    "Sentinel-2 L2A — RGB (aligned, 10 m UTM)",
-    os.path.join(ALIGNED_DIR, "sentinel2_rgb.png"),
-    bands=(3, 2, 1), stretch=3.0,
-)
-
-# Sentinel-2 NDVI
-print("\n--- Sentinel-2 aligned (NDVI) ---")
-plot_raster(
-    s2_aligned_path,
-    "Sentinel-2 — NDVI (aligned, 10 m UTM)",
-    os.path.join(ALIGNED_DIR, "sentinel2_ndvi.png"),
-    band=5, cmap="RdYlGn", vmin=-0.2, vmax=0.9,
-)
-
-# COP-DEM
-print("\n--- Copernicus DEM aligned ---")
-plot_raster(
-    dem_aligned_path,
-    "Copernicus DEM 30 m → 10 m (aligned UTM)",
-    os.path.join(ALIGNED_DIR, "copdem30.png"),
-    cmap="terrain",
-)
-
-# TCD
-print("\n--- TCD aligned ---")
-plot_raster(
-    tcd_aligned_path,
-    "TCD — Tree Cover Density (aligned, 10 m UTM)",
-    os.path.join(ALIGNED_DIR, "tcd.png"),
-    band=1, cmap="Greens", vmin=0, vmax=255,
-)
-
-# IMD
-print("\n--- IMD aligned ---")
-plot_raster(
-    imd_aligned_path,
-    "IMD — Imperviousness (aligned, 10 m UTM)",
-    os.path.join(ALIGNED_DIR, "imd.png"),
-    band=1, cmap="Reds", vmin=0, vmax=255,
-)
-
-# DTM Lidar (original, not aligned)
-print("\n--- DTM Lidar HD (target, not aligned) ---")
-plot_raster(
-    FILES["dtm_lidar"],
-    "DTM Lidar HD — target (original, not reprojected)",
-    os.path.join(ALIGNED_DIR, "dtm_lidar_target.png"),
-    cmap="terrain", nodata_val=-99999.0,
-)
-
-
-# =============================================================================
-# 7. Summary panel
-# =============================================================================
-print("\n" + "=" * 60)
-print("SUMMARY PANEL")
-print("=" * 60)
-
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-
-# Sentinel-2 RGB
-with rasterio.open(s2_aligned_path) as src:
-    rgb = np.stack([src.read(b).astype("float32") for b in [3, 2, 1]], axis=-1)
-axes[0, 0].imshow(np.clip(rgb * 3, 0, 1))
-axes[0, 0].set_title("Sentinel-2 RGB")
-
-# NDVI
-with rasterio.open(s2_aligned_path) as src:
-    ndvi = src.read(5)
-im1 = axes[0, 1].imshow(ndvi, cmap="RdYlGn", vmin=-0.2, vmax=0.9)
-axes[0, 1].set_title("NDVI")
-plt.colorbar(im1, ax=axes[0, 1], shrink=0.7)
-
-# COP-DEM
-with rasterio.open(dem_aligned_path) as src:
-    dem = src.read(1)
-    dem[~np.isfinite(dem)] = np.nan
-im2 = axes[0, 2].imshow(dem, cmap="terrain")
-axes[0, 2].set_title("Copernicus DEM 30 m")
-plt.colorbar(im2, ax=axes[0, 2], shrink=0.7, label="m")
-
-# TCD
-with rasterio.open(tcd_aligned_path) as src:
-    tcd = src.read(1)
-    tcd[~np.isfinite(tcd)] = np.nan
-im3 = axes[1, 0].imshow(tcd, cmap="Greens", vmin=0, vmax=255)
-axes[1, 0].set_title("TCD (tree cover)")
-plt.colorbar(im3, ax=axes[1, 0], shrink=0.7)
-
-# IMD
-with rasterio.open(imd_aligned_path) as src:
-    imd = src.read(1)
-    imd[~np.isfinite(imd)] = np.nan
-im4 = axes[1, 1].imshow(imd, cmap="Reds", vmin=0, vmax=255)
-axes[1, 1].set_title("IMD (imperviousness)")
-plt.colorbar(im4, ax=axes[1, 1], shrink=0.7)
-
-# DTM Lidar
-with rasterio.open(FILES["dtm_lidar"]) as src:
-    dtm = src.read(1).astype("float32")
-    dtm[dtm == -99999.0] = np.nan
-im5 = axes[1, 2].imshow(dtm, cmap="terrain")
-axes[1, 2].set_title("DTM Lidar HD (target)")
-plt.colorbar(im5, ax=axes[1, 2], shrink=0.7, label="m")
-
-for ax in axes.flat:
-    ax.set_xlabel("Column")
-    ax.set_ylabel("Row")
-
-plt.suptitle(f"Data Overview — {ZONE.title()} — Inputs + Target", fontsize=16, y=1.01)
-plt.tight_layout()
-panel_path = os.path.join(OUTPUT_DIR, "data_overview.png")
-plt.savefig(panel_path, dpi=150, bbox_inches="tight")
-plt.close()
-print(f"  Panel: {panel_path}")
-
-
-# =============================================================================
-# 8. Comparison panel: all 6 layers side by side
-# =============================================================================
-print("\n" + "=" * 60)
-print("COMPARISON PANEL — 6 ALIGNED LAYERS")
-print("=" * 60)
-
-fig, axes = plt.subplots(2, 3, figsize=(20, 13))
-
-# --- Row 1 ---
-
-# 1) Sentinel-2 RGB
-with rasterio.open(s2_aligned_path) as src:
-    rgb = np.stack([src.read(b).astype("float32") for b in [3, 2, 1]], axis=-1)
-axes[0, 0].imshow(np.clip(rgb * 3, 0, 1))
-axes[0, 0].set_title("Sentinel-2 RGB", fontsize=13, fontweight="bold")
-
-# 2) NDVI
-with rasterio.open(s2_aligned_path) as src:
-    ndvi = src.read(5)
-im_ndvi = axes[0, 1].imshow(ndvi, cmap="RdYlGn", vmin=-0.2, vmax=0.9)
-axes[0, 1].set_title("NDVI (Sentinel-2)", fontsize=13, fontweight="bold")
-plt.colorbar(im_ndvi, ax=axes[0, 1], shrink=0.7)
-
-# 3) Copernicus DEM
-with rasterio.open(dem_aligned_path) as src:
-    dem = src.read(1)
-    dem[~np.isfinite(dem)] = np.nan
-im_dem = axes[0, 2].imshow(dem, cmap="terrain")
-axes[0, 2].set_title("Copernicus DEM 30 m", fontsize=13, fontweight="bold")
-plt.colorbar(im_dem, ax=axes[0, 2], shrink=0.7, label="m")
-
-# --- Row 2 ---
-
-# 4) TCD
-with rasterio.open(tcd_aligned_path) as src:
-    tcd = src.read(1)
-    tcd[~np.isfinite(tcd)] = np.nan
-im_tcd = axes[1, 0].imshow(tcd, cmap="Greens", vmin=0, vmax=255)
-axes[1, 0].set_title("TCD (tree cover)", fontsize=13, fontweight="bold")
-plt.colorbar(im_tcd, ax=axes[1, 0], shrink=0.7)
-
-# 5) IMD
-with rasterio.open(imd_aligned_path) as src:
-    imd = src.read(1)
-    imd[~np.isfinite(imd)] = np.nan
-im_imd = axes[1, 1].imshow(imd, cmap="Reds", vmin=0, vmax=255)
-axes[1, 1].set_title("IMD (imperviousness)", fontsize=13, fontweight="bold")
-plt.colorbar(im_imd, ax=axes[1, 1], shrink=0.7)
-
-# 6) DTM Lidar (target)
-with rasterio.open(FILES["dtm_lidar"]) as src:
-    dtm = src.read(1).astype("float32")
-    dtm[dtm == -99999.0] = np.nan
-im_dtm = axes[1, 2].imshow(dtm, cmap="terrain")
-axes[1, 2].set_title("DTM Lidar HD (target)", fontsize=13, fontweight="bold")
-plt.colorbar(im_dtm, ax=axes[1, 2], shrink=0.7, label="m")
-
-for ax in axes.flat:
-    ax.set_xlabel("Column")
-    ax.set_ylabel("Row")
-
-plt.suptitle(
-    f"Overview — {ZONE.title()} — 4 inputs + NDVI + DTM target",
-    fontsize=16, fontweight="bold", y=1.01,
-)
-plt.tight_layout()
-comparison_path = os.path.join(OUTPUT_DIR, "comparison_6_layers.png")
-plt.savefig(comparison_path, dpi=150, bbox_inches="tight")
-plt.close()
-print(f"  Comparison figure: {comparison_path}")
-
-
-# =============================================================================
-# 9. Summary
-# =============================================================================
-print("\n" + "=" * 60)
-print("SUMMARY")
-print("=" * 60)
-
-aligned_files = {
-    "Sentinel-2 (5 bands)": s2_aligned_path,
-    "Copernicus DEM 30 m":  dem_aligned_path,
-    "TCD (band 1)":         tcd_aligned_path,
-    "IMD (band 1)":         imd_aligned_path,
-}
-
-print("\nAligned files (same grid: EPSG:32630, 10 m):")
-for name, path in aligned_files.items():
-    with rasterio.open(path) as src:
-        size_kb = os.path.getsize(path) / 1024
-        print(f"  {name:30s} → {src.width}x{src.height}, {src.count} band(s), {size_kb:.0f} KB")
-
-print(f"\nTarget (not reprojected):")
-with rasterio.open(FILES["dtm_lidar"]) as src:
-    size_kb = os.path.getsize(FILES["dtm_lidar"]) / 1024
-    print(f"  DTM Lidar HD               → {src.width}x{src.height}, {src.count} band(s), {size_kb:.0f} KB")
-
-print(f"\nOriginal figures: {ORIGINAL_DIR}/")
-for f in sorted(os.listdir(ORIGINAL_DIR)):
-    print(f"  {f}")
-
-print(f"\nAligned figures:  {ALIGNED_DIR}/")
-for f in sorted(os.listdir(ALIGNED_DIR)):
-    print(f"  {f}")
-
-print(f"\nPanel:      {panel_path}")
-print(f"Comparison: {comparison_path}")
-print("\nDone!")
+if __name__ == "__main__":
+    main()
