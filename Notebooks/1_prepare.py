@@ -1,20 +1,23 @@
 """
 1_prepare.py
 ============
-Reprojects and aligns all raw inputs to the Sentinel-2 reference grid for
+Reprojects and aligns all raw inputs to the COP-DEM 30 m reference grid for
 every zone, then generates diagnostic plots.
+
+All inputs are kept at 30 m (no interpolation).  The Lidar HD DTM target is
+downsampled from ~50 cm to 30 m.  Super-resolution is left for a later stage.
 
 For each zone the following aligned files are saved under
   data/aligned/{zone_id}/:
-  sentinel2.tif   -- 5 bands (B02, B03, B04, B08, NDVI) -- reference grid
-  copdem30.tif    -- COP-DEM 30 m bilinearly resampled to 10 m
-  slope.tif       -- terrain slope (degrees) derived from aligned COP-DEM
-  tcd.tif         -- TCD greyscale proxy (0-255, derived from RGBA WMS render)
-  imd.tif         -- IMD greyscale proxy (0-255, derived from RGBA WMS render)
-  dtm_lidar.tif   -- Lidar HD DTM bilinearly resampled to 10 m  [TARGET]
+  copdem30.tif    -- COP-DEM 30 m  (reference grid, native resolution)
+  slope.tif       -- terrain slope (degrees) derived from COP-DEM
+  sentinel2.tif   -- 5 bands (B02, B03, B04, B08, NDVI) downsampled to 30 m
+  tcd.tif         -- TCD 0-1  (WCS numeric /100, or inverted WMS luminance)
+  imd.tif         -- IMD 0-1  (WCS numeric /100, or inverted WMS luminance)
+  dtm_lidar.tif   -- Lidar HD DTM downsampled to 30 m  [TARGET]
 
 All outputs share the exact same CRS, transform, width, and height as the
-corresponding zone's Sentinel-2 image (auto-detected from data/zones/{id}/).
+zone's COP-DEM tile (auto-detected from data/zones/{id}/copdem30.tif).
 
 Usage
 -----
@@ -41,12 +44,12 @@ from rasterio.warp import calculate_default_transform, reproject
 # 1.  Geometry helpers
 # ---------------------------------------------------------------------------
 
-def get_reference_grid(s2_path: Path) -> dict:
+def get_reference_grid(ref_path: Path) -> dict:
     """
-    Extract CRS, transform, width, height from the Sentinel-2 file.
+    Extract CRS, transform, width, height from a reference raster.
     All other layers will be reprojected to match this grid.
     """
-    with rasterio.open(s2_path) as src:
+    with rasterio.open(ref_path) as src:
         return dict(
             crs       = src.crs,
             transform = src.transform,
@@ -272,42 +275,46 @@ def prepare_zone(zone_id: str, data_root: Path, output_root: Path,
     aligned_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    s2_raw = raw_dir / "sentinel2.tif"
+    s2_raw  = raw_dir / "sentinel2.tif"
+    dem_raw = raw_dir / "copdem30.tif"
+
     if not s2_raw.exists():
         print(f"  ERROR: {s2_raw} not found -- run 0_download_data.py first")
         return False
 
+    # Use COP-DEM as reference grid (native 30 m, no input interpolation).
+    # Fall back to S2 only if COP-DEM is missing.
+    ref_file = dem_raw if dem_raw.exists() else s2_raw
     if verbose:
-        print(f"\n[1] Reference grid from {s2_raw.name}")
-    grid = get_reference_grid(s2_raw)
+        print(f"\n[1] Reference grid from {ref_file.name}")
+    grid = get_reference_grid(ref_file)
     res  = abs(grid["transform"].a)   # pixel size in metres (CRS units)
     if verbose:
         print(f"  CRS: {grid['crs']}  size: {grid['width']}x{grid['height']}  "
               f"res: {res:.1f} m/px")
 
     # ------------------------------------------------------------------ #
-    # Sentinel-2 (reproject all 5 bands in one pass)                     #
+    # COP-DEM 30 m  (reference layer — reproject to canonical grid)      #
     # ------------------------------------------------------------------ #
-    s2_aligned = aligned_dir / "sentinel2.tif"
-    if verbose:
-        print(f"[2] Aligning Sentinel-2 ...")
-    reproject_multiband(s2_raw, s2_aligned, grid)
-    if verbose:
-        print(f"  -> {s2_aligned.name}")
-
-    # ------------------------------------------------------------------ #
-    # COP-DEM 30 m                                                        #
-    # ------------------------------------------------------------------ #
-    dem_raw     = raw_dir     / "copdem30.tif"
     dem_aligned = aligned_dir / "copdem30.tif"
     if dem_raw.exists():
         if verbose:
-            print("[3] Aligning COP-DEM ...")
+            print("[2] Aligning COP-DEM (reference, 30 m) ...")
         reproject_to_grid(dem_raw, dem_aligned, grid, resampling=Resampling.bilinear)
         if verbose:
             print(f"  -> {dem_aligned.name}")
     else:
         print(f"  WARNING: {dem_raw} not found -- skipping COP-DEM")
+
+    # ------------------------------------------------------------------ #
+    # Sentinel-2 (downsample all 5 bands from 10 m to 30 m)             #
+    # ------------------------------------------------------------------ #
+    s2_aligned = aligned_dir / "sentinel2.tif"
+    if verbose:
+        print("[3] Downsampling Sentinel-2 to 30 m ...")
+    reproject_multiband(s2_raw, s2_aligned, grid)
+    if verbose:
+        print(f"  -> {s2_aligned.name}")
 
     # ------------------------------------------------------------------ #
     # Slope (derived from aligned COP-DEM)                               #

@@ -208,7 +208,7 @@ def _build_mask_proxy(y_batch: torch.Tensor,
     """
     veg   = (tcd > 0.0).float()   # TCD proxy > 0 after norm -> vegetated
     built = (imd > 0.0).float()   # IMD proxy > 0 after norm -> impervious
-    return torch.stack([built, veg], dim=1)   # (B, 2, H, W)
+    return torch.cat([built, veg], dim=1)   # (B, 2, H, W)
 
 
 def train_one_epoch(model, loader, optimizer, device, scaler=None):
@@ -356,7 +356,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train U-Net for Lidar HD DTM estimation from multi-source inputs."
     )
-    parser.add_argument("--epochs",      type=int, default=60)
+    parser.add_argument("--epochs",      type=int, default=2000)
     parser.add_argument("--batch-size",  type=int, default=4)
     parser.add_argument("--lr",          type=float, default=1e-3)
     parser.add_argument("--base-filters",type=int, default=32)
@@ -440,7 +440,7 @@ def main():
         optimizer, T_max=args.epochs, eta_min=1e-5)
 
     # Optional AMP (CUDA only)
-    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     start_epoch = 0
     if args.resume:
