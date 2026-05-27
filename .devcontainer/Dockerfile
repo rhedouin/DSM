@@ -108,5 +108,10 @@ RUN python3.11 -m pip install jax[cuda12] numpyro
 
 RUN python3.11 -m pip install pystac_client
 
+RUN python3.11 -m pip install torch
 
+RUN pip install --no-cache-dir \
+    "torch==2.7.1+cu128" torchvision torchaudio \
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
+RUN pip install --no-cache-dir xgboost
