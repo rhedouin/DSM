@@ -7,6 +7,8 @@ defined in zones.py (or a user-specified subset).
 For each zone the following files are saved under  data/zones/{zone_id}/:
   sentinel2.tif    -- bands B02, B03, B04, B08 + NDVI  (10 m, via AWS STAC)
   copdem30.tif     -- Copernicus DEM 30 m               (via AWS STAC)
+  water_mask.tif   -- COP-DEM Water Body Mask (WBM)     (via AWS S3 AUXFILES)
+                       uint8: 0=land, 1=ocean, 2=inland water, 3=river
   tcd.tif          -- Tree Cover Density  (WMS RGBA render, ~10 m)
   imd.tif          -- Imperviousness Degree (WMS RGBA render, ~10 m)
   dtm_lidar.tif    -- High-resolution Lidar HD DTM ~50 cm (WMS, TARGET)
@@ -377,6 +379,84 @@ def _mosaic_cop_dem(items: list, bbox_wgs84: list[float]
             except Exception: pass
 
 
+def _mosaic_cop_wbm(items: list, bbox_wgs84: list[float]
+                   ) -> "tuple[np.ndarray, dict] | tuple[None, None]":
+    """
+    Read and mosaic COP-DEM Water Body Mask (WBM) tiles for a bounding box.
+
+    The WBM lives in the AUXFILES/ sub-folder of each DEM tile on S3:
+      .../Copernicus_DSM_COG_10_N##_00_E###_00_DEM/
+              AUXFILES/Copernicus_DSM_COG_10_N##_00_E###_00_WBM.tif
+
+    Values (uint8):
+      0 = land (no water)
+      1 = ocean / sea
+      2 = inland water (lakes)
+      3 = river
+    Nodata = 255 (used for boundless padding).
+    """
+    NODATA_B: int = 255
+    datasets: list[rasterio.DatasetReader] = []
+    memfiles: list[rasterio.MemoryFile]    = []
+    try:
+        for item in items:
+            dem_href = item.assets["data"].href
+            folder, filename = dem_href.rsplit("/", 1)
+            wbm_href = f"{folder}/AUXFILES/{filename.replace('_DEM.tif', '_WBM.tif')}"
+            try:
+                with rasterio.open(wbm_href) as src:
+                    bounds = transform_bounds("EPSG:4326", src.crs, *bbox_wgs84)
+                    window = from_bounds(*bounds, transform=src.transform)
+                    data = src.read(
+                        1, window=window,
+                        boundless=True, fill_value=NODATA_B,
+                    ).astype("uint8")
+                    prof = src.profile.copy()
+                    prof.update(
+                        width     = data.shape[1],
+                        height    = data.shape[0],
+                        transform = src.window_transform(window),
+                        driver    = "GTiff",
+                        dtype     = "uint8",
+                        compress  = "deflate",
+                        nodata    = NODATA_B,
+                        count     = 1,
+                    )
+                mf = rasterio.MemoryFile()
+                with rasterio.open(mf, "w", **prof) as ds:
+                    ds.write(data[np.newaxis])
+                memfiles.append(mf)
+                datasets.append(rasterio.open(mf))
+            except Exception as exc:
+                print(f"    WARNING: could not read WBM tile {item.id} ({exc})")
+
+        if not datasets:
+            return None, None
+
+        if len(datasets) == 1:
+            arr  = datasets[0].read(1).astype("uint8")
+            prof = datasets[0].profile.copy()
+            return arr, prof
+
+        mosaic, tr = rasterio.merge.merge(datasets, nodata=NODATA_B, method="first")
+        prof = datasets[0].profile.copy()
+        prof.update(
+            width     = mosaic.shape[-1],
+            height    = mosaic.shape[-2],
+            transform = tr,
+            nodata    = NODATA_B,
+        )
+        return mosaic[0].astype("uint8"), prof
+
+    finally:
+        for ds in datasets:
+            try: ds.close()
+            except Exception: pass
+        for mf in memfiles:
+            try: mf.close()
+            except Exception: pass
+
+
 def _cop_dem_zero_frac(path: Path) -> float:
     """Fraction of pixels with value exactly 0.0 in the COP-DEM raster."""
     try:
@@ -693,11 +773,13 @@ def download_zone(zone: dict, data_root: Path, force: bool = False,
                 paths["sentinel2"] = None
 
     # D -- Copernicus DEM 30 m  (AWS STAC COG)
-    print("\n[D] Copernicus DEM 30 m")
+    print("\n[D] Copernicus DEM 30 m  +  Water Body Mask")
     dem_path = zone_dir / "copdem30.tif"
-    if dem_path.exists() and not force:
+    wbm_path = zone_dir / "water_mask.tif"
+    if dem_path.exists() and wbm_path.exists() and not force:
         print("  Already exists -- skipping")
-        paths["copdem30"] = dem_path
+        paths["copdem30"]    = dem_path
+        paths["water_mask"]  = wbm_path
     else:
         catalog   = Client.open(STAC_AWS)
         dem_items = list(catalog.search(
@@ -705,18 +787,40 @@ def download_zone(zone: dict, data_root: Path, force: bool = False,
         print(f"  DEM tiles found: {len(dem_items)}")
         if not dem_items:
             print("  ERROR: no COP-DEM tile found")
-            paths["copdem30"] = None
+            paths["copdem30"]   = None
+            paths["water_mask"] = None
         else:
-            dem_data, dem_profile = _mosaic_cop_dem(dem_items, bbox)
-            if dem_data is None:
-                print("  ERROR: could not read any DEM tile")
-                paths["copdem30"] = None
+            if not dem_path.exists() or force:
+                dem_data, dem_profile = _mosaic_cop_dem(dem_items, bbox)
+                if dem_data is None:
+                    print("  ERROR: could not read any DEM tile")
+                    paths["copdem30"] = None
+                else:
+                    save_tif(dem_path, dem_data, dem_profile, band_names=["COP-DEM-30m"])
+                    valid = dem_data[dem_data > -32000]
+                    elev_str = f"[{valid.min():.1f}, {valid.max():.1f}] m" if valid.size else "no valid pixels"
+                    print(f"  Elevation: {elev_str}  ({len(dem_items)} tile(s) mosaicked)")
+                    paths["copdem30"] = dem_path
             else:
-                save_tif(dem_path, dem_data, dem_profile, band_names=["COP-DEM-30m"])
-                valid = dem_data[dem_data > -32000]
-                elev_str = f"[{valid.min():.1f}, {valid.max():.1f}] m" if valid.size else "no valid pixels"
-                print(f"  Elevation: {elev_str}  ({len(dem_items)} tile(s) mosaicked)")
+                print("  copdem30.tif already exists -- skipping DEM")
                 paths["copdem30"] = dem_path
+
+            if not wbm_path.exists() or force:
+                print("  WBM ...", end=" ", flush=True)
+                wbm_data, wbm_profile = _mosaic_cop_wbm(dem_items, bbox)
+                if wbm_data is None:
+                    print("FAILED -- no water mask downloaded")
+                    paths["water_mask"] = None
+                else:
+                    save_tif(wbm_path, wbm_data, wbm_profile,
+                             band_names=["WBM-0land-1ocean-2lake-3river"])
+                    n_water = int((wbm_data > 0).sum())
+                    pct = 100.0 * n_water / max(wbm_data.size, 1)
+                    print(f"  Water pixels: {n_water} ({pct:.1f}%)")
+                    paths["water_mask"] = wbm_path
+            else:
+                print("  water_mask.tif already exists -- skipping WBM")
+                paths["water_mask"] = wbm_path
 
     # E -- TCD (WMS RGBA)
     # Note: WMS returns a colourised visualisation. Greyscale luminance used as proxy.
@@ -809,7 +913,7 @@ def main():
         )
 
     # Global summary table
-    layers = ["sentinel2", "copdem30", "tcd", "imd", "dtm_lidar"]
+    layers = ["sentinel2", "copdem30", "water_mask", "tcd", "imd", "dtm_lidar"]
     print(f"\n{'=' * 64}")
     print("  GLOBAL DOWNLOAD SUMMARY")
     print(f"{'=' * 64}")
@@ -828,8 +932,10 @@ def main():
                     row += f"  {'⚠ WARN':12s}"
                 else:
                     row += f"  {'OK':12s}"
+            elif ok:
+                row += f"  {'OK':12s}"
             else:
-                row += f"  {'OK':12s}" if ok else f"  {'MISSING':12s}"
+                row += f"  {'MISSING':12s}"
         print(row)
     print()
     if cop_dem_warnings:

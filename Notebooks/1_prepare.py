@@ -12,7 +12,13 @@ All other inputs are reprojected / resampled to match this grid exactly:
   slope.tif      -- slope in degrees derived from the 10 m COP-DEM
   tcd.tif        -- TCD [0–1]  (see format detection below)
   imd.tif        -- IMD [0–1]  (same logic)
+  water_mask.tif -- COP-DEM WBM resampled with nearest neighbour (0=land, >0=water)
   dtm_lidar.tif  -- Lidar HD DTM resampled to 10 m  [TARGET]
+
+  All float layers (copdem30, slope, tcd, imd, dtm_lidar, sentinel2) have
+  their water pixels (water_mask > 0) set to NaN after alignment.
+  A union NaN mask is then applied: any pixel that is NaN in any layer
+  (inputs or target) is set to NaN in all layers.
 
 TCD / IMD format detection (automatic, no --force needed)
 ----------------------------------------------------------
@@ -395,7 +401,112 @@ def prepare_zone(zone_id: str, data_root: Path, output_root: Path,
     else:
         print(f"  WARNING: {dtm_raw} not found -- target missing")
 
-    # ── [8] Residual diagnostic ───────────────────────────────────────────
+    # ── [8] Water mask (COP-DEM WBM → 10 m nearest) ──────────────────────
+    wbm_raw     = raw_dir     / "water_mask.tif"
+    wbm_aligned = aligned_dir / "water_mask.tif"
+    if wbm_raw.exists():
+        if verbose:
+            print("[8] Reprojecting water mask (WBM, nearest neighbour) ...")
+        reproject_to_grid(wbm_raw, wbm_aligned, grid,
+                          resampling=Resampling.nearest, nodata=np.nan)
+        if verbose:
+            with rasterio.open(wbm_aligned) as src:
+                wm = src.read(1)
+                n_water = int((wm > 0).sum())
+                pct = 100.0 * n_water / max(wm.size, 1)
+                print(f"  -> {wbm_aligned.name}  "
+                      f"water pixels: {n_water} ({pct:.1f}%)")
+
+        # Apply water mask: set water pixels to NaN in all float layers
+        if verbose:
+            print("[8] Applying water mask (NaN) to all aligned layers ...")
+        with rasterio.open(wbm_aligned) as src:
+            water_mask = (src.read(1) > 0)   # True where water
+
+        n_masked = int(water_mask.sum())
+        if n_masked > 0:
+            # Single-band float layers
+            single_band_layers = [
+                "copdem30.tif", "slope.tif", "tcd.tif", "imd.tif", "dtm_lidar.tif",
+            ]
+            for fname in single_band_layers:
+                p = aligned_dir / fname
+                if not p.exists():
+                    continue
+                with rasterio.open(p) as src:
+                    arr    = src.read(1).astype("float32")
+                    prof   = src.profile.copy()
+                    descr  = src.descriptions[0] or ""
+                arr[water_mask] = np.nan
+                with rasterio.open(p, "w", **prof) as dst:
+                    dst.write(arr, 1)
+                    if descr:
+                        dst.set_band_description(1, descr)
+
+            # Multi-band Sentinel-2
+            s2_aligned = aligned_dir / "sentinel2.tif"
+            if s2_aligned.exists():
+                with rasterio.open(s2_aligned) as src:
+                    stack  = src.read().astype("float32")
+                    prof   = src.profile.copy()
+                    descrs = [src.descriptions[i] or "" for i in range(src.count)]
+                stack[:, water_mask] = np.nan
+                with rasterio.open(s2_aligned, "w", **prof) as dst:
+                    dst.write(stack)
+                    for i, d in enumerate(descrs, 1):
+                        if d:
+                            dst.set_band_description(i, d)
+
+            if verbose:
+                print(f"  NaN applied to {n_masked} water pixels "
+                      f"across all layers.")
+    else:
+        print(f"  WARNING: {wbm_raw} not found -- skipping water mask")
+
+    # ── [8b] Union NaN mask across all layers ─────────────────────────────
+    # Build the union of all NaN positions across every aligned layer so that
+    # any pixel that is NaN in *any* input or in the target is NaN everywhere.
+    if verbose:
+        print("[8b] Building union NaN mask across all aligned layers ...")
+
+    float_layers = [
+        aligned_dir / "sentinel2.tif",   # multi-band (first band used for mask)
+        aligned_dir / "copdem30.tif",
+        aligned_dir / "slope.tif",
+        aligned_dir / "tcd.tif",
+        aligned_dir / "imd.tif",
+        aligned_dir / "dtm_lidar.tif",
+    ]
+    nan_union: "np.ndarray | None" = None
+    for p in float_layers:
+        if not p.exists():
+            continue
+        with rasterio.open(p) as src:
+            arr = src.read(1).astype("float32")
+        nan_union = ~np.isfinite(arr) if nan_union is None else (nan_union | ~np.isfinite(arr))
+
+    if nan_union is not None and nan_union.any():
+        n_union = int(nan_union.sum())
+        for p in float_layers:
+            if not p.exists():
+                continue
+            with rasterio.open(p) as src:
+                stack  = src.read().astype("float32")
+                prof   = src.profile.copy()
+                descrs = [src.descriptions[i] or "" for i in range(src.count)]
+            stack[:, nan_union] = np.nan
+            with rasterio.open(p, "w", **prof) as dst:
+                dst.write(stack)
+                for i, d in enumerate(descrs, 1):
+                    if d:
+                        dst.set_band_description(i, d)
+        if verbose:
+            print(f"  Union NaN mask: {n_union} pixels "
+                  f"({100.0 * n_union / nan_union.size:.1f}%) masked in all layers.")
+    elif verbose:
+        print("  No additional pixels to union-mask.")
+
+    # ── [9] Residual diagnostic ───────────────────────────────────────────
     if dem_aligned.exists() and dtm_aligned.exists():
         if verbose:
             with rasterio.open(dtm_aligned) as s1, rasterio.open(dem_aligned) as s2:
@@ -439,19 +550,21 @@ def _make_plots(zone_id: str, aligned_dir: Path, fig_dir: Path) -> None:
                 elev_vmax = hi if elev_vmax is None else max(elev_vmax, hi)
 
     panels = [
-        ("sentinel2.tif",  "S2 true colour (B04/B03/B02)",     "viridis", "",     None,       None      ),
-        ("copdem30.tif",   "COP-DEM → 10 m (m)",              "terrain", "m",    elev_vmin,  elev_vmax ),
-        ("slope.tif",      "Slope from COP-DEM (°)",           "hot_r",   "deg",  None,       None      ),
-        ("tcd.tif",        "TCD (tree cover density, 0–1)",    "Greens",  "0–1",  0.0,        1.0       ),
-        ("imd.tif",        "IMD (imperviousness, 0–1)",        "Reds",    "0–1",  0.0,        1.0       ),
-        ("dtm_lidar.tif",  "DTM Lidar HD 10 m [TARGET] (m)",  "terrain", "m",    elev_vmin,  elev_vmax ),
+        ("sentinel2.tif",  "S2 true colour (B04/B03/B02)",     "viridis", "",      None,       None      ),
+        ("copdem30.tif",   "COP-DEM → 10 m (m)",               "terrain", "m",     elev_vmin,  elev_vmax ),
+        ("slope.tif",      "Slope from COP-DEM (°)",            "hot_r",   "deg",   None,       None      ),
+        ("tcd.tif",        "TCD (tree cover density, 0–1)",     "Greens",  "0–1",   0.0,        1.0       ),
+        ("imd.tif",        "IMD (imperviousness, 0–1)",         "Reds",    "0–1",   0.0,        1.0       ),
+        ("water_mask.tif", "Water mask (0=land, 1-3=water)",   "Blues",   "class", 0.0,        3.0       ),
+        ("dtm_lidar.tif",  "DTM Lidar HD 10 m [TARGET] (m)",   "terrain", "m",     elev_vmin,  elev_vmax ),
     ]
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
     fig.suptitle(f"Zone: {zone_id}  — aligned to Sentinel-2 10 m UTM grid",
                  fontsize=12)
 
-    for ax, (fname, title, cmap, unit, vmin, vmax) in zip(axes.ravel(), panels):
+    all_axes = axes.ravel()
+    for ax, (fname, title, cmap, unit, vmin, vmax) in zip(all_axes, panels):
         p = aligned_dir / fname
         if not p.exists():
             ax.set_title(f"{title}\n(missing)", fontsize=9)
@@ -472,6 +585,10 @@ def _make_plots(zone_id: str, aligned_dir: Path, fig_dir: Path) -> None:
             cbar.ax.set_visible(False)
         else:
             _plot_raster(ax, data, title, cmap=cmap, unit=unit, vmin=vmin, vmax=vmax)
+
+    # Hide the last empty subplot (7 panels in a 2×4 grid)
+    for ax in all_axes[len(panels):]:
+        ax.set_visible(False)
 
     plt.tight_layout()
     fig.savefig(fig_dir / "overview_aligned.png", dpi=150, bbox_inches="tight")
